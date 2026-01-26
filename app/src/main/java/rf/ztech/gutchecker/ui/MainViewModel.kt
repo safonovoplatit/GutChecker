@@ -6,8 +6,15 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import rf.ztech.gutchecker.data.*
+import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.TimeUnit
+
+data class ChatMessage(
+    val text: String,
+    val isUser: Boolean,
+    val timestamp: Long = System.currentTimeMillis()
+)
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val db = AppDatabase.getDatabase(application)
@@ -21,32 +28,130 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         .map { it ?: UserProfile() }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserProfile())
 
-    // 2️⃣ Список советов по питанию (не медицинские)
-    private val healthTips = listOf(
-        "Пейте достаточно воды в течение дня для поддержания гидратации.",
-        "Старайтесь есть медленно и тщательно пережевывать пищу.",
-        "Регулярное питание в одно и то же время помогает настроить пищеварение.",
-        "Попробуйте добавить в рацион больше продуктов с мягкой клетчаткой.",
-        "Ведите дневник питания, чтобы заметить связь между продуктами и симптомами.",
-        "Ограничьте употребление газированных напитков во время приема пищи.",
-        "Легкая прогулка после еды может улучшить моторику кишечника."
-    )
-
-    val dailyTip: String = healthTips[Calendar.getInstance().get(Calendar.DAY_OF_YEAR) % healthTips.size]
-
-    // 1️⃣ Стрик (дни С эпизодами)
+    // 1️⃣ Здоровый стрик (дней без эпизодов)
     val streak: StateFlow<Int> = allEpisodes.map { episodes ->
-        calculateActiveStreak(episodes)
+        calculateHealthyStreak(episodes)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
-    // 3️⃣ AI-сводка за текущий день (rule-based эвристика)
-    val dailySummary: StateFlow<String> = allEpisodes.map { episodes ->
-        generateDailySummary(episodes)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "Данных за сегодня пока нет.")
+    // --- Stats for Plaques ---
+    val casesToday: StateFlow<Int> = allEpisodes.map { episodes ->
+        val todayStart = getStartOfDay()
+        episodes.count { it.timestamp >= todayStart }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    val casesLast7Days: StateFlow<Int> = allEpisodes.map { episodes ->
+        val weekAgo = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(7)
+        episodes.count { it.timestamp >= weekAgo }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    val casesLast30Days: StateFlow<Int> = allEpisodes.map { episodes ->
+        val monthAgo = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(30)
+        episodes.count { it.timestamp >= monthAgo }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    private fun getStartOfDay(): Long {
+        val calendar = Calendar.getInstance()
+        calendar.set(Calendar.HOUR_OF_DAY, 0)
+        calendar.set(Calendar.MINUTE, 0)
+        calendar.set(Calendar.SECOND, 0)
+        calendar.set(Calendar.MILLISECOND, 0)
+        return calendar.timeInMillis
+    }
+
+    // --- AI Chat Logic (Disabled for now) ---
+    private val _chatMessages = MutableStateFlow<List<ChatMessage>>(listOf(
+        ChatMessage("Привет! AI-чат временно недоступен, так как мы работаем над улучшением локальной модели. Вы все еще можете добавлять записи и видеть сводку за день.", false)
+    ))
+    val chatMessages: StateFlow<List<ChatMessage>> = _chatMessages.asStateFlow()
+
+    private val _isChatLoading = MutableStateFlow(false)
+    val isChatLoading: StateFlow<Boolean> = _isChatLoading.asStateFlow()
+
+    fun sendMessage(text: String) {
+        if (text.isBlank()) return
+        
+        val userMsg = ChatMessage(text, true)
+        _chatMessages.value = _chatMessages.value + userMsg
+        
+        _chatMessages.value = _chatMessages.value + ChatMessage("AI-ассистент временно отключен.", false)
+    }
+
+    // --- AI Daily Tip (Offline fallback) ---
+    private val _dailyTip = MutableStateFlow("Пейте достаточное количество воды в течение дня.")
+    val dailyTip: StateFlow<String> = _dailyTip.asStateFlow()
+
+    private val offlineTips = listOf(
+        "Пейте достаточное количество воды в течение дня.",
+        "Употребляйте больше клетчатки: овощи, фрукты и цельнозерновые продукты.",
+        "Старайтесь питаться небольшими порциями, но чаще.",
+        "Регулярная физическая активность помогает пищеварению.",
+        "Избегайте избыточного потребления кофеина и сахара.",
+        "Тщательно пережевывайте пищу — это первый шаг к хорошему пищеварению.",
+        "Пробиотики в йогуртах или кефире полезны для микрофлоры кишечника."
+    )
+
+    private fun refreshDailyTip() {
+        val randomTip = offlineTips.random()
+        _dailyTip.value = randomTip
+    }
+
+    // --- AI-сводка (Always Rule-based for now) ---
+    private val _isGenerating = MutableStateFlow(false)
+    val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
+
+    private val _aiSummary = MutableStateFlow("Данных за сегодня пока нет.")
+    val aiSummary: StateFlow<String> = _aiSummary.asStateFlow()
+
+    init {
+        // Автоматически обновляем сводку при изменении эпизодов
+        allEpisodes.onEach { episodes ->
+            refreshAiSummary(episodes)
+        }.launchIn(viewModelScope)
+        
+        refreshDailyTip()
+    }
+
+    fun refreshAiSummary() {
+        refreshAiSummary(allEpisodes.value)
+    }
+
+    private fun refreshAiSummary(episodes: List<Episode>) {
+        val todayStart = getStartOfDay()
+        val todayEpisodes = episodes.filter { it.timestamp >= todayStart }
+
+        if (todayEpisodes.isEmpty()) {
+            _aiSummary.value = "Сегодня записей не зафиксировано. Продолжайте наблюдение."
+            return
+        }
+
+        _aiSummary.value = generateRuleBasedSummary(todayEpisodes)
+    }
+
+    private fun generateRuleBasedSummary(todayEpisodes: List<Episode>): String {
+        val count = todayEpisodes.size
+        val avgLevel = todayEpisodes.map { it.diarrheaLevel }.average()
+        val symptomCount = todayEpisodes.count { it.hasPain || it.hasBloating || it.hasFever || it.hasNausea }
+
+        val levelText = when {
+            avgLevel <= 3 -> "низкий"
+            avgLevel <= 7 -> "умеренный"
+            else -> "высокий"
+        }
+
+        val summary = StringBuilder()
+        summary.append("Сегодня зафиксировано $count ${if (count == 1) "эпизод" else "эпизода"}. ")
+        summary.append("Средний уровень дискомфорта — $levelText (${String.format("%.1f", avgLevel)}). ")
+
+        if (symptomCount > 0) {
+            summary.append("Сопутствующие симптомы отмечены в $symptomCount ${if (symptomCount == 1) "записи" else "записях"}. ")
+        }
+        summary.append("\n\nЭто автоматическая сводка на основе ваших данных.")
+        return summary.toString()
+    }
 
     val last7DaysStats: StateFlow<List<Pair<String, Int>>> = allEpisodes.map { episodes ->
         val stats = mutableListOf<Pair<String, Int>>()
-        val dayFormat = java.text.SimpleDateFormat("EEE", Locale.getDefault())
+        val dayFormat = SimpleDateFormat("EEE", Locale.getDefault())
 
         for (i in 6 downTo 0) {
             val dayCalendar = Calendar.getInstance()
@@ -65,17 +170,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         stats
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    fun addEpisode(
-        consistency: Int,
-        color: String,
-        volume: StoolVolume,
-        hasPain: Boolean,
-        hasBloating: Boolean,
-        hasFever: Boolean,
-        hasNausea: Boolean,
-        note: String,
-        diarrheaLevel: Int
-    ) {
+    fun addEpisode(consistency: Int, color: String, volume: StoolVolume, hasPain: Boolean, hasBloating: Boolean, hasFever: Boolean, hasNausea: Boolean, note: String, diarrheaLevel: Int) {
         viewModelScope.launch {
             episodeDao.insertEpisode(Episode(
                 timestamp = System.currentTimeMillis(),
@@ -117,77 +212,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun calculateActiveStreak(episodes: List<Episode>): Int {
+    private fun calculateHealthyStreak(episodes: List<Episode>): Int {
         if (episodes.isEmpty()) return 0
-        val calendar = Calendar.getInstance()
-        calendar.set(Calendar.HOUR_OF_DAY, 0)
-        calendar.set(Calendar.MINUTE, 0)
-        calendar.set(Calendar.SECOND, 0)
-        calendar.set(Calendar.MILLISECOND, 0)
+
+        val todayStart = getStartOfDay()
         
-        var checkDateStart = calendar.timeInMillis
-        var streakCount = 0
+        // If there were episodes today, the healthy streak is 0
+        if (episodes.any { it.timestamp >= todayStart }) return 0
 
-        // Проверяем, были ли эпизоды сегодня
-        val episodesToday = episodes.any { it.timestamp >= checkDateStart }
-        if (!episodesToday) return 0 // Стрик прерывается, если сегодня записей нет
+        // Find the most recent episode
+        val lastEpisodeTimestamp = episodes.maxOfOrNull { it.timestamp } ?: return 0
 
-        while (true) {
-            val hasEpisodesOnDay = episodes.any { 
-                it.timestamp >= checkDateStart && it.timestamp < checkDateStart + TimeUnit.DAYS.toMillis(1) 
-            }
-            
-            if (hasEpisodesOnDay) {
-                streakCount++
-                checkDateStart -= TimeUnit.DAYS.toMillis(1)
-            } else {
-                break
-            }
-            if (streakCount > 365) break 
-        }
-        return streakCount
-    }
+        // Calculate full days between today's start and the last episode's day start
+        val lastEpisodeCalendar = Calendar.getInstance()
+        lastEpisodeCalendar.timeInMillis = lastEpisodeTimestamp
+        lastEpisodeCalendar.set(Calendar.HOUR_OF_DAY, 0)
+        lastEpisodeCalendar.set(Calendar.MINUTE, 0)
+        lastEpisodeCalendar.set(Calendar.SECOND, 0)
+        lastEpisodeCalendar.set(Calendar.MILLISECOND, 0)
 
-    private fun generateDailySummary(episodes: List<Episode>): String {
-        val calendar = Calendar.getInstance()
-        calendar.set(Calendar.HOUR_OF_DAY, 0)
-        calendar.set(Calendar.MINUTE, 0)
-        calendar.set(Calendar.SECOND, 0)
-        calendar.set(Calendar.MILLISECOND, 0)
-        val todayStart = calendar.timeInMillis
-        
-        val todayEpisodes = episodes.filter { it.timestamp >= todayStart }
-        if (todayEpisodes.isEmpty()) return "Сегодня записей не зафиксировано. Продолжайте наблюдение."
-
-        val count = todayEpisodes.size
-        val avgLevel = todayEpisodes.map { it.diarrheaLevel }.average()
-        val symptomCount = todayEpisodes.count { it.hasPain || it.hasBloating || it.hasFever || it.hasNausea }
-        
-        val levelText = when {
-            avgLevel <= 3 -> "низкий"
-            avgLevel <= 7 -> "умеренный"
-            else -> "высокий"
-        }
-
-        val summary = StringBuilder()
-        summary.append("Сегодня зафиксировано $count ${if (count == 1) "эпизод" else "эпизода"}. ")
-        summary.append("Средний уровень дискомфорта — $levelText (${String.format("%.1f", avgLevel)}). ")
-        
-        if (symptomCount > 0) {
-            summary.append("Сопутствующие симптомы отмечены в $symptomCount ${if (symptomCount == 1) "записи" else "записях"}. ")
-        } else {
-            summary.append("Дополнительных симптомов не зафиксировано. ")
-        }
-
-        // Эвристика по времени
-        val morningCount = todayEpisodes.count { 
-            val h = Calendar.getInstance().apply { timeInMillis = it.timestamp }.get(Calendar.HOUR_OF_DAY)
-            h in 6..11
-        }
-        if (morningCount > count / 2) {
-            summary.append("Большинство эпизодов произошло в первой половине дня.")
-        }
-
-        return summary.toString()
+        val diffMillis = todayStart - lastEpisodeCalendar.timeInMillis
+        return (diffMillis / TimeUnit.DAYS.toMillis(1)).toInt()
     }
 }
