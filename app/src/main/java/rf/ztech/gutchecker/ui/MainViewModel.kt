@@ -28,12 +28,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         .map { it ?: UserProfile() }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserProfile())
 
-    // 1️⃣ Здоровый стрик (дней без эпизодов)
     val streak: StateFlow<Int> = allEpisodes.map { episodes ->
         calculateHealthyStreak(episodes)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
-    // --- Stats for Plaques ---
     val casesToday: StateFlow<Int> = allEpisodes.map { episodes ->
         val todayStart = getStartOfDay()
         episodes.count { it.timestamp >= todayStart }
@@ -58,25 +56,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return calendar.timeInMillis
     }
 
-    // --- AI Chat Logic (Disabled for now) ---
     private val _chatMessages = MutableStateFlow<List<ChatMessage>>(listOf(
-        ChatMessage("Привет! AI-чат временно недоступен, так как мы работаем над улучшением локальной модели. Вы все еще можете добавлять записи и видеть сводку за день.", false)
+        ChatMessage("Привет! Я твой ассистент GutKeeper. Чем могу помочь?", false)
     ))
     val chatMessages: StateFlow<List<ChatMessage>> = _chatMessages.asStateFlow()
 
     private val _isChatLoading = MutableStateFlow(false)
     val isChatLoading: StateFlow<Boolean> = _isChatLoading.asStateFlow()
 
+    init {
+        allEpisodes.onEach { episodes ->
+            refreshAiSummary(episodes)
+        }.launchIn(viewModelScope)
+        
+        refreshDailyTip()
+    }
+
     fun sendMessage(text: String) {
-        if (text.isBlank()) return
+        if (text.isBlank() || _isChatLoading.value) return
         
         val userMsg = ChatMessage(text, true)
         _chatMessages.value = _chatMessages.value + userMsg
         
-        _chatMessages.value = _chatMessages.value + ChatMessage("AI-ассистент временно отключен.", false)
+        // Simple mock response since LLM is removed
+        _chatMessages.value = _chatMessages.value + ChatMessage("Спасибо за сообщение! В данный момент ИИ-функции отключены.", false)
     }
 
-    // --- AI Daily Tip (Offline fallback) ---
     private val _dailyTip = MutableStateFlow("Пейте достаточное количество воды в течение дня.")
     val dailyTip: StateFlow<String> = _dailyTip.asStateFlow()
 
@@ -95,21 +100,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _dailyTip.value = randomTip
     }
 
-    // --- AI-сводка (Always Rule-based for now) ---
-    private val _isGenerating = MutableStateFlow(false)
-    val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
-
     private val _aiSummary = MutableStateFlow("Данных за сегодня пока нет.")
     val aiSummary: StateFlow<String> = _aiSummary.asStateFlow()
-
-    init {
-        // Автоматически обновляем сводку при изменении эпизодов
-        allEpisodes.onEach { episodes ->
-            refreshAiSummary(episodes)
-        }.launchIn(viewModelScope)
-        
-        refreshDailyTip()
-    }
 
     fun refreshAiSummary() {
         refreshAiSummary(allEpisodes.value)
@@ -145,7 +137,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (symptomCount > 0) {
             summary.append("Сопутствующие симптомы отмечены в $symptomCount ${if (symptomCount == 1) "записи" else "записях"}. ")
         }
-        summary.append("\n\nЭто автоматическая сводка на основе ваших данных.")
         return summary.toString()
     }
 
@@ -216,14 +207,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (episodes.isEmpty()) return 0
 
         val todayStart = getStartOfDay()
-        
-        // If there were episodes today, the healthy streak is 0
         if (episodes.any { it.timestamp >= todayStart }) return 0
 
-        // Find the most recent episode
         val lastEpisodeTimestamp = episodes.maxOfOrNull { it.timestamp } ?: return 0
 
-        // Calculate full days between today's start and the last episode's day start
         val lastEpisodeCalendar = Calendar.getInstance()
         lastEpisodeCalendar.timeInMillis = lastEpisodeTimestamp
         lastEpisodeCalendar.set(Calendar.HOUR_OF_DAY, 0)
